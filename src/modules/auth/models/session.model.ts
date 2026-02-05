@@ -69,17 +69,17 @@ sessionSchema.index({ previousRefreshToken: 1 }); // Index để tìm nhanh khi 
 
 /**
  * TTL index cho session:
- * - Tự động xoá session sau 30 ngày không hoạt động (dựa trên lastActiveAt)
- * - Giúp implement behavior "ghi nhớ đăng nhập trên thiết bị trong 30 ngày"
+ * - Tự động xoá session sau 3 ngày không hoạt động (dựa trên lastActiveAt)
+ * - Giúp implement behavior "ghi nhớ đăng nhập trên thiết bị trong 3 ngày"
  *
  * Mỗi lần refresh token, lastActiveAt sẽ được cập nhật,
  * nên nếu user vẫn dùng app thường xuyên thì session sẽ được giữ,
- * còn nếu bỏ app > 30 ngày thì session + refresh token sẽ tự bị xoá.
+ * còn nếu bỏ app > 3 ngày thì session + refresh token sẽ tự bị xoá.
  */
 sessionSchema.index(
   { lastActiveAt: 1 },
   {
-    expireAfterSeconds: 30 * 24 * 60 * 60
+    expireAfterSeconds: 3 * 24 * 60 * 60 // 3 ngày = 259200 giây
   }
 );
 
