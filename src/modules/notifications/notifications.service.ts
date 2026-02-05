@@ -17,6 +17,9 @@ export class NotificationsService {
     fromUserId?: string,
     sendPush: boolean = true
   ): Promise<INotification> {
+    // Notification type 'message' luôn được đánh dấu đã đọc ngay từ đầu
+    const isRead = type === 'message';
+    
     // Tạo notification trong DB
     const notification = await Notification.create({
       userId,
@@ -25,7 +28,8 @@ export class NotificationsService {
       title,
       body,
       data: data || {},
-      read: false
+      read: isRead,
+      readAt: isRead ? new Date() : undefined
     });
 
     // Gửi push notification nếu được yêu cầu
