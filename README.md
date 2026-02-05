@@ -1,4 +1,4 @@
-# TRQ Chat - Realtime Chat API
+# TRQ-API
 
 Hệ thống chat realtime hoàn chỉnh với Express, MongoDB, JWT, và Socket.io.
 
