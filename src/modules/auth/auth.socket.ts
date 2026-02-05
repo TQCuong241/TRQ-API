@@ -33,14 +33,32 @@ export const initializeAuthSocket = (io: Server) => {
 
     socket.join(`user:${socket.userId}`);
 
-    // Update last seen - removed usersService dependency
-    // await usersService.updateLastSeen(socket.userId!);
+    // Cập nhật trạng thái online + lastSeenAt khi user kết nối
+    try {
+      if (socket.userId) {
+        await User.updateOne(
+          { _id: socket.userId },
+          {
+            $set: {
+              onlineStatus: 'online',
+              lastSeenAt: new Date()
+            }
+          }
+        );
+      }
+    } catch (error) {
+      console.error('Lỗi cập nhật onlineStatus khi connect:', error);
+    }
 
     const connectedUserIds = new Set<string>();
     io.sockets.sockets.forEach((s: AuthSocket) => {
       if (s.userId) connectedUserIds.add(s.userId);
     });
-    socket.emit('users:online:list', { userIds: Array.from(connectedUserIds) });
+    const onlineUserIds = Array.from(connectedUserIds);
+    socket.emit('users:online:list', {
+      userIds: onlineUserIds,
+      total: onlineUserIds.length
+    });
 
     socket.broadcast.emit('user:online', {
       userId: socket.userId,
@@ -67,9 +85,23 @@ export const initializeAuthSocket = (io: Server) => {
 
     socket.on('disconnect', async () => {
       console.log(`Người dùng đã ngắt kết nối: ${socket.userId}`);
-      
-      // Update online status on disconnect - removed usersService dependency
-      // await usersService.updateOnlineStatusOnDisconnect(socket.userId!);
+
+      // Cập nhật lastSeenAt + onlineStatus khi user ngắt kết nối
+      try {
+        if (socket.userId) {
+          await User.updateOne(
+            { _id: socket.userId },
+            {
+              $set: {
+                lastSeenAt: new Date(),
+                onlineStatus: 'recently'
+              }
+            }
+          );
+        }
+      } catch (error) {
+        console.error('Lỗi cập nhật onlineStatus khi disconnect:', error);
+      }
 
       socket.broadcast.emit('user:offline', {
         userId: socket.userId,

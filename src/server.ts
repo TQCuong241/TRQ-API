@@ -39,7 +39,7 @@ const startServer = async () => {
       console.log(`
 ╔══════════════════════════════════════════╗
 ║     Máy chủ đã khởi động thành công      ║
-║        http://localhost:${PORT}          ║
+║        ${process.env.BASE_URL}          ║
 ║                                          ║
 ║   MongoDB đã kết nối                    ║
 ║   Socket.io đã sẵn sàng                  ║

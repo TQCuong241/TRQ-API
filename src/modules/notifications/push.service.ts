@@ -60,7 +60,7 @@ export function initializeFirebaseAdmin(): void {
       // Parse JSON từ environment variable
       try {
         serviceAccount = JSON.parse(serviceAccountJson);
-        console.log('📝 Đã load Firebase service account từ FIREBASE_SERVICE_ACCOUNT_JSON');
+        console.log(' Đã load Firebase service account từ FIREBASE_SERVICE_ACCOUNT_JSON');
       } catch (error) {
         console.error('❌ Lỗi parse FIREBASE_SERVICE_ACCOUNT_JSON:', error);
         return;
