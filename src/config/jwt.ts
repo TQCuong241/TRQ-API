@@ -2,7 +2,9 @@ import jwt, { SignOptions } from 'jsonwebtoken';
 import crypto from 'crypto';
 
 const JWT_SECRET: string = process.env.JWT_SECRET || 'your_jwt_secret_key';
-const JWT_EXPIRE: string = process.env.JWT_EXPIRE || '15m';
+// Access token: mặc định 3 ngày (để match với refresh cycle 3 ngày)
+// User có thể override trong .env: JWT_EXPIRE=3d hoặc JWT_EXPIRE=7d
+const JWT_EXPIRE: string = process.env.JWT_EXPIRE || '3d';
 const REFRESH_TOKEN_EXPIRE: string = process.env.REFRESH_TOKEN_EXPIRE || '3d';
 
 export const generateToken = (userId: string): string => {
