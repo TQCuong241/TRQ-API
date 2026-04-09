@@ -112,11 +112,9 @@ export async function sendPushNotification(
     throw new Error('Firebase Admin SDK chưa được khởi tạo');
   }
 
+  const isAndroidMessage = platform === 'android' && data?.type === 'message';
+
   const message: any = {
-    notification: {
-      title,
-      body
-    },
     data: {
       ...Object.keys(data).reduce((acc, key) => {
         acc[key] = String(data[key]);
@@ -125,6 +123,16 @@ export async function sendPushNotification(
     },
     token
   };
+
+  if (!isAndroidMessage) {
+    message.notification = {
+      title,
+      body
+    };
+  } else {
+    message.data.custom_title = title;
+    message.data.custom_body = body;
+  }
 
   // Platform-specific configuration
   if (platform === 'android') {
@@ -180,11 +188,9 @@ export async function sendPushNotificationToMultiple(
     return { successCount: 0, failureCount: 0 };
   }
 
+  const isAndroidMessage = platform === 'android' && data?.type === 'message';
+
   const message: any = {
-    notification: {
-      title,
-      body
-    },
     data: {
       ...Object.keys(data).reduce((acc, key) => {
         acc[key] = String(data[key]);
@@ -192,6 +198,16 @@ export async function sendPushNotificationToMultiple(
       }, {} as any)
     }
   };
+
+  if (!isAndroidMessage) {
+    message.notification = {
+      title,
+      body
+    };
+  } else {
+    message.data.custom_title = title;
+    message.data.custom_body = body;
+  }
 
   // Platform-specific configuration
   if (platform === 'android') {

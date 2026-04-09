@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import usersController from './users.controller';
 import { authMiddleware } from '../../middlewares/auth.middleware';
-import { uploadAvatar, uploadCover } from '../../middlewares/upload.middleware';
+import { uploadAvatar } from '../../middlewares/upload-avatar.middleware';
+import { uploadCover } from '../../middlewares/upload-cover.middleware';
 
 const router = Router();
 

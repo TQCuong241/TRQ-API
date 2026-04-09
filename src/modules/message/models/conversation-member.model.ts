@@ -17,6 +17,11 @@ export interface IConversationMember extends Document {
 
   unreadCount: number;
 
+  /**
+   * Nháp tin nhắn của user trong phòng này (chưa gửi)
+   */
+  draft?: string | null;
+
   joinedAt: Date;
   leftAt?: Date | null;
 
@@ -68,6 +73,11 @@ const conversationMemberSchema = new Schema<IConversationMember>(
     unreadCount: {
       type: Number,
       default: 0
+    },
+    draft: {
+      type: String,
+      default: null,
+      maxlength: 10000
     },
     joinedAt: {
       type: Date,

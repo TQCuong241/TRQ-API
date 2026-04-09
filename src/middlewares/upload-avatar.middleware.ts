@@ -2,7 +2,6 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 
-// Avatar upload
 const avatarsDir = path.join(process.cwd(), 'uploads', 'avatars');
 if (!fs.existsSync(avatarsDir)) {
   fs.mkdirSync(avatarsDir, { recursive: true });
@@ -16,23 +15,6 @@ const avatarStorage = multer.diskStorage({
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     const ext = path.extname(file.originalname);
     cb(null, `avatar-${uniqueSuffix}${ext}`);
-  }
-});
-
-// Cover photo upload
-const coversDir = path.join(process.cwd(), 'uploads', 'covers');
-if (!fs.existsSync(coversDir)) {
-  fs.mkdirSync(coversDir, { recursive: true });
-}
-
-const coverStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, coversDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname);
-    cb(null, `cover-${uniqueSuffix}${ext}`);
   }
 });
 
@@ -55,12 +37,3 @@ export const uploadAvatar = multer({
   },
   fileFilter: fileFilter
 });
-
-export const uploadCover = multer({
-  storage: coverStorage,
-  limits: {
-    fileSize: 5 * 1024 * 1024
-  },
-  fileFilter: fileFilter
-});
-

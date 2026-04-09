@@ -5,6 +5,7 @@ export type ConversationType = 'PRIVATE' | 'GROUP';
 export interface IConversationLastMessage {
   messageId: mongoose.Types.ObjectId;
   senderId: mongoose.Types.ObjectId;
+  senderName?: string;
   text: string;
   createdAt: Date;
 }
@@ -13,6 +14,7 @@ export interface IConversation extends Document {
   type: ConversationType;
   name?: string;
   avatar?: string;
+  themeEmoji?: string;
   // Cho phòng PRIVATE: lưu thông tin user kia
   otherUserId?: mongoose.Types.ObjectId;
   otherUserName?: string; // displayName hoặc username của user kia
@@ -37,6 +39,10 @@ const lastMessageSchema = new Schema<IConversationLastMessage>(
     senderId: {
       type: Schema.Types.ObjectId,
       ref: 'User'
+    },
+    senderName: {
+      type: String,
+      default: ''
     },
     text: {
       type: String,
@@ -65,6 +71,10 @@ const conversationSchema = new Schema<IConversation>(
     avatar: {
       type: String,
       trim: true
+    },
+    themeEmoji: {
+      type: String,
+      default: '👍'
     },
     // Cho phòng PRIVATE: lưu thông tin user kia để hiển thị tên
     otherUserId: {

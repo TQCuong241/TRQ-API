@@ -1,4 +1,6 @@
 import mongoose from 'mongoose';
+import fs from 'fs';
+import path from 'path';
 import Conversation, { IConversation } from './models/conversation.model';
 import ConversationMember, { IConversationMember } from './models/conversation-member.model';
 import Message, {
@@ -9,6 +11,31 @@ import Message, {
 import Block from '../friends/models/block.model';
 import User from '../auth/auth.model';
 import notificationsService from '../notifications/notifications.service';
+
+// ─── Helper: xóa file media vật lý trên disk ──────────────────────────────────
+function deleteMediaFiles(mediaUrl: string | null | undefined): void {
+  if (!mediaUrl) return;
+  // Hỗ trợ JSON array (nhiều ảnh)
+  let urls: string[] = [];
+  try {
+    const parsed = JSON.parse(mediaUrl);
+    if (Array.isArray(parsed)) urls = parsed;
+  } catch {
+    urls = [mediaUrl];
+  }
+  for (const u of urls) {
+    if (!u || !u.startsWith('/uploads/')) continue;
+    try {
+      const filePath = path.join(process.cwd(), u);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log('[Media] Đã xóa file:', filePath);
+      }
+    } catch (err) {
+      console.error('[Media] Lỗi xóa file:', u, err);
+    }
+  }
+}
 
 export interface CreatePrivateConversationResult {
   conversation: IConversation;
@@ -411,10 +438,10 @@ class MessageService {
     }
 
     const uniqueMemberIds = Array.from(new Set([currentUserId, ...memberIds]));
-
     const memberObjectIds = uniqueMemberIds.map((id) => new mongoose.Types.ObjectId(id));
     const creatorId = new mongoose.Types.ObjectId(currentUserId);
 
+    // Thử dùng transaction trước (production với replica set)
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -448,11 +475,52 @@ class MessageService {
         conversation: conversationDoc,
         members
       };
-    } catch (error) {
+    } catch (error: any) {
       await session.abortTransaction();
       session.endSession();
+
+      // Fallback cho MongoDB standalone (không hỗ trợ transaction)
+      if (error.code === 20 || error.codeName === 'IllegalOperation') {
+        return await this._createGroupConversationWithoutTransaction(
+          creatorId,
+          currentUserId,
+          name,
+          memberObjectIds
+        );
+      }
+
       throw error;
     }
+  }
+
+  /**
+   * Tạo nhóm chat không dùng transaction (fallback cho development / MongoDB standalone)
+   */
+  private async _createGroupConversationWithoutTransaction(
+    creatorId: mongoose.Types.ObjectId,
+    currentUserId: string,
+    name: string,
+    memberObjectIds: mongoose.Types.ObjectId[]
+  ): Promise<CreateGroupConversationResult> {
+    const conversation = await Conversation.create({
+      type: 'GROUP',
+      name: name.trim(),
+      createdBy: creatorId,
+      memberCount: memberObjectIds.length
+    });
+
+    const membersToCreate = memberObjectIds.map((uid) => ({
+      conversationId: conversation._id,
+      userId: uid,
+      role: uid.toString() === currentUserId ? 'ADMIN' : 'MEMBER'
+    }));
+
+    const members = await ConversationMember.create(membersToCreate);
+
+    return {
+      conversation,
+      members
+    };
   }
 
   /**
@@ -462,7 +530,8 @@ class MessageService {
     conversationId: string,
     userId: string,
     page: number = 1,
-    limit: number = 50
+    limit: number = 50,
+    type?: string
   ): Promise<{
     messages: IMessage[];
     total: number;
@@ -483,20 +552,23 @@ class MessageService {
 
     const skip = (page - 1) * limit;
 
+    const query: any = {
+      conversationId: convObjectId,
+      deletedForUsers: { $ne: userObjectId }
+    };
+
+    if (type) {
+      query.type = type;
+    }
+
     const [messages, total] = await Promise.all([
-      Message.find({
-        conversationId: convObjectId,
-        isDeleted: false
-      })
+      Message.find(query)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
         .lean()
         .exec(),
-      Message.countDocuments({
-        conversationId: convObjectId,
-        isDeleted: false
-      })
+      Message.countDocuments(query)
     ]);
 
     return {
@@ -553,7 +625,7 @@ class MessageService {
       Message.find({
         conversationId: convObjectId,
         senderId: senderObjectId,
-        isDeleted: false
+        deletedForUsers: { $ne: userObjectId }
       })
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -563,7 +635,7 @@ class MessageService {
       Message.countDocuments({
         conversationId: convObjectId,
         senderId: senderObjectId,
-        isDeleted: false
+        deletedForUsers: { $ne: userObjectId }
       })
     ]);
 
@@ -679,6 +751,10 @@ class MessageService {
       replyToMessageId
     });
 
+    // Lấy tên người gửi trước để dùng trong lastMessage
+    const senderUser = await User.findById(userId).select('displayName username').lean();
+    const senderDisplayName = senderUser?.displayName || senderUser?.username || 'Người dùng';
+
     // Cập nhật lastMessage + unreadCount
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -714,6 +790,7 @@ class MessageService {
             lastMessage: {
               messageId: message._id,
               senderId: userObjectId,
+              senderName: senderDisplayName,
               text: lastMessageText,
               createdAt: message.createdAt
             }
@@ -722,14 +799,23 @@ class MessageService {
         { session }
       );
 
-      // Tăng unreadCount cho các member khác (đơn giản: +1, client có thể sync lại nếu cần)
+      const now = new Date();
+      // Cập nhật updatedAt cho người gửi để đưa lên đầu danh sách
+      await ConversationMember.updateOne(
+        { conversationId: convObjectId, userId: userObjectId },
+        { $set: { updatedAt: now } },
+        { session }
+      );
+
+      // Tăng unreadCount và cập nhật updatedAt cho các member khác
       await ConversationMember.updateMany(
         {
           conversationId: convObjectId,
           userId: { $ne: userObjectId }
         },
         {
-          $inc: { unreadCount: 1 }
+          $inc: { unreadCount: 1 },
+          $set: { updatedAt: now }
         },
         { session }
       );
@@ -773,11 +859,18 @@ class MessageService {
               lastMessage: {
                 messageId: message._id,
                 senderId: userObjectId,
+                senderName: senderDisplayName,
                 text: lastMessageText,
                 createdAt: message.createdAt
               }
             }
           }
+        );
+
+        const fallbackNow = new Date();
+        await ConversationMember.updateOne(
+          { conversationId: convObjectId, userId: userObjectId },
+          { $set: { updatedAt: fallbackNow } }
         );
 
         await ConversationMember.updateMany(
@@ -786,7 +879,8 @@ class MessageService {
             userId: { $ne: userObjectId }
           },
           {
-            $inc: { unreadCount: 1 }
+            $inc: { unreadCount: 1 },
+            $set: { updatedAt: fallbackNow }
           }
         );
       } else {
@@ -1041,6 +1135,30 @@ class MessageService {
       throw new Error('Không có dữ liệu nào để cập nhật');
     }
 
+    const oldMember = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+
+    if (!oldMember) throw new Error('Bạn không ở trong phòng chat này');
+
+    // Xóa file ảnh nền cũ nếu người dùng cập nhật sang màu hoặc ảnh khác
+    if (
+      allowedUpdates.customBackground !== undefined &&
+      oldMember.customBackground &&
+      oldMember.customBackground !== allowedUpdates.customBackground &&
+      oldMember.customBackground.startsWith('/uploads/')
+    ) {
+      try {
+        const oldPath = path.join(process.cwd(), oldMember.customBackground);
+        if (fs.existsSync(oldPath)) {
+          fs.unlinkSync(oldPath);
+        }
+      } catch (err) {
+        console.error('Lỗi khi xóa nền cũ:', err);
+      }
+    }
+
     const member = await ConversationMember.findOneAndUpdate(
       {
         conversationId: convObjectId,
@@ -1059,6 +1177,972 @@ class MessageService {
     }
 
     return member;
+  }
+
+  /**
+   * Sửa nội dung tin nhắn
+   */
+  async editMessage(
+    conversationId: string,
+    userId: string,
+    messageId: string,
+    text: string
+  ): Promise<IMessage> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const message = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId
+    });
+    if (!message) throw new Error('Tin nhắn không tồn tại');
+    if (message.isDeleted) throw new Error('Không thể sửa tin nhắn đã xóa');
+    if (message.senderId.toString() !== userId)
+      throw new Error('Bạn không có quyền sửa tin nhắn này');
+
+    message.content.text = text;
+    message.isEdited = true;
+    message.editedAt = new Date();
+    await message.save();
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitMessageEdited } = await import('./message.socket');
+        emitMessageEdited(io, conversationId, {
+          conversationId,
+          messageId,
+          content: message.content,
+          isEdited: true,
+          editedAt: message.editedAt,
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit editMessage:', error);
+    }
+
+    return message;
+  }
+
+  /**
+   * Xóa tin nhắn (deleteForEveryone: true → xóa tất cả, false → chỉ ẩn với mình)
+   */
+  async deleteMessage(
+    conversationId: string,
+    userId: string,
+    messageId: string,
+    deleteForEveryone: boolean = false
+  ): Promise<{ messageId: string; deletedForEveryone: boolean }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const message = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId
+    });
+    if (!message) throw new Error('Tin nhắn không tồn tại');
+
+    if (deleteForEveryone) {
+      if (message.senderId.toString() !== userId) {
+        throw new Error('Bạn không có quyền thu hồi tin nhắn này');
+      }
+      message.isDeleted = true;
+
+      // Xóa file media vật lý khi thu hồi tin nhắn cho tất cả
+      const mediaTypes: MessageType[] = ['IMAGE', 'VIDEO', 'AUDIO', 'FILE'];
+      if (mediaTypes.includes(message.type as MessageType) && message.content?.mediaUrl) {
+        deleteMediaFiles(message.content.mediaUrl);
+      }
+    } else {
+      if (!message.deletedForUsers) {
+        message.deletedForUsers = [];
+      }
+      const hasId = message.deletedForUsers.some((uid: any) => uid.toString() === userId);
+      if (!hasId) {
+        message.deletedForUsers.push(userObjectId as any);
+      }
+
+      // Kiểm tra nếu tất cả thành viên đã xóa tin nhắn này -> có thể xóa file vật lý
+      try {
+        const allMembers = await ConversationMember.find({ conversationId: convObjectId }).lean();
+        const allMemberIds = allMembers.map(m => (m.userId as any).toString());
+        const deletedForUserIds = message.deletedForUsers.map((id: any) => id.toString());
+        const allDeleted = allMemberIds.every(mid => deletedForUserIds.includes(mid));
+        
+        if (allDeleted) {
+          const mediaTypes: MessageType[] = ['IMAGE', 'VIDEO', 'AUDIO', 'FILE'];
+          if (mediaTypes.includes(message.type as MessageType) && message.content?.mediaUrl) {
+            deleteMediaFiles(message.content.mediaUrl);
+          }
+        }
+      } catch(err) {
+        console.error('Lỗi khi kiểm tra xóa file vật lý cho tin nhắn:', err);
+      }
+    }
+
+    await message.save();
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitMessageDeleted } = await import('./message.socket');
+        emitMessageDeleted(io, conversationId, {
+          conversationId,
+          messageId,
+          deletedForEveryone: deleteForEveryone,
+          deletedBy: userId,
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit deleteMessage:', error);
+    }
+
+    return { messageId, deletedForEveryone: deleteForEveryone };
+  }
+
+  /**
+   * Chuyển tiếp tin nhắn sang nhiều phòng
+   */
+  async forwardMessage(
+    conversationId: string,
+    userId: string,
+    messageId: string,
+    targetConversationIds: string[]
+  ): Promise<{ forwarded: number }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const original = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId,
+      isDeleted: false
+    });
+    if (!original) throw new Error('Tin nhắn không tồn tại');
+
+    let forwarded = 0;
+    for (const targetId of targetConversationIds) {
+      try {
+        const targetConvObjectId = new mongoose.Types.ObjectId(targetId);
+        const targetMember = await ConversationMember.findOne({
+          conversationId: targetConvObjectId,
+          userId: userObjectId
+        });
+        if (!targetMember) continue;
+
+        const newMessage = await Message.create({
+          conversationId: targetConvObjectId,
+          senderId: userObjectId,
+          type: original.type,
+          content: {
+            text: original.content.text,
+            mediaUrl: original.content.mediaUrl,
+            mimeType: original.content.mimeType,
+            fileName: original.content.fileName,
+            fileSize: original.content.fileSize,
+            duration: original.content.duration
+          },
+          forward: {
+            fromMessageId: messageObjectId,
+            fromUserId: original.senderId,
+            fromConversationId: convObjectId,
+            fromAt: original.createdAt
+          }
+        });
+
+        // Update lastMessage
+        await Conversation.updateOne(
+          { _id: targetConvObjectId },
+          {
+            $set: {
+              lastMessage: {
+                messageId: newMessage._id,
+                senderId: userObjectId,
+                text: original.type === 'TEXT' ? (original.content.text || 'Tin nhắn đã chuyển tiếp') : 'Đã chuyển tiếp một tin nhắn',
+                createdAt: newMessage.createdAt
+              }
+            }
+          }
+        );
+
+        await ConversationMember.updateMany(
+          { conversationId: targetConvObjectId, userId: { $ne: userObjectId } },
+          { $inc: { unreadCount: 1 } }
+        );
+
+        // Emit realtime
+        try {
+          const { io } = await import('../../server');
+          if (io) {
+            const { emitNewMessage, emitConversationListUpdated } = await import('./message.socket');
+            emitNewMessage(io, targetId, newMessage.toObject(), { senderId: userId });
+            const targetMembers = await ConversationMember.find({ conversationId: targetConvObjectId }).lean();
+            for (const m of targetMembers) {
+              if ((m.userId as any).toString() !== userId) {
+                emitConversationListUpdated(io, (m.userId as any).toString());
+              }
+            }
+          }
+        } catch (e) {
+          console.error('Lỗi emit forwardMessage:', e);
+        }
+
+        forwarded++;
+      } catch (e) {
+        console.error(`Lỗi forward đến conversation ${targetId}:`, e);
+      }
+    }
+
+    return { forwarded };
+  }
+
+  /**
+   * Ghim tin nhắn
+   */
+  async pinMessage(
+    conversationId: string,
+    userId: string,
+    messageId: string
+  ): Promise<IMessage> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const message = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId,
+      isDeleted: false
+    });
+    if (!message) throw new Error('Tin nhắn không tồn tại');
+
+    message.isPinned = true;
+    message.pinnedBy = userObjectId;
+    message.pinnedAt = new Date();
+    await message.save();
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitMessagePinned } = await import('./message.socket');
+        emitMessagePinned(io, conversationId, {
+          conversationId,
+          messageId,
+          pinnedBy: userId,
+          pinnedAt: message.pinnedAt,
+          action: 'pinned',
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit pinMessage:', error);
+    }
+
+    return message;
+  }
+
+  /**
+   * Bỏ ghim tin nhắn
+   */
+  async unpinMessage(
+    conversationId: string,
+    userId: string,
+    messageId: string
+  ): Promise<{ messageId: string }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const message = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId,
+      isDeleted: false
+    });
+    if (!message) throw new Error('Tin nhắn không tồn tại');
+
+    message.isPinned = false;
+    message.pinnedBy = undefined;
+    message.pinnedAt = null;
+    await message.save();
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitMessagePinned } = await import('./message.socket');
+        emitMessagePinned(io, conversationId, {
+          conversationId,
+          messageId,
+          pinnedBy: userId,
+          pinnedAt: null,
+          action: 'unpinned',
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit unpinMessage:', error);
+    }
+
+    return { messageId };
+  }
+
+  /**
+   * Lấy danh sách tin nhắn đã ghim
+   */
+  async getPinnedMessages(
+    conversationId: string,
+    userId: string
+  ): Promise<{ messages: IMessage[] }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const messages = await Message.find({
+      conversationId: convObjectId,
+      isPinned: true,
+      isDeleted: false,
+      deletedForUsers: { $ne: userObjectId }
+    })
+      .sort({ pinnedAt: -1 })
+      .lean()
+      .exec();
+
+    return { messages };
+  }
+
+  /**
+   * Đánh dấu tin nhắn đã xem
+   */
+  async markMessageSeen(
+    conversationId: string,
+    userId: string,
+    messageId: string
+  ): Promise<{ seenBy: string[] }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const messageObjectId = new mongoose.Types.ObjectId(messageId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const message = await Message.findOne({
+      _id: messageObjectId,
+      conversationId: convObjectId,
+      isDeleted: false
+    });
+    if (!message) throw new Error('Tin nhắn không tồn tại');
+
+    // Thêm vào seenBy nếu chưa có
+    const alreadySeen = message.seenBy.some(
+      (s) => s.userId.toString() === userId
+    );
+
+    if (!alreadySeen) {
+      message.seenBy.push({ userId: userObjectId, seenAt: new Date() } as any);
+      await message.save();
+    }
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitMessageSeen } = await import('./message.socket');
+        emitMessageSeen(io, conversationId, {
+          conversationId,
+          messageId,
+          userId,
+          seenAt: new Date(),
+          senderId: message.senderId.toString(),
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit markMessageSeen:', error);
+    }
+
+    return {
+      seenBy: message.seenBy.map((s) => (s.userId as any).toString())
+    };
+  }
+
+  /**
+   * Tìm kiếm tin nhắn trong phòng
+   */
+  async searchMessages(
+    conversationId: string,
+    userId: string,
+    query: string,
+    page: number = 1,
+    limit: number = 20
+  ): Promise<{
+    messages: IMessage[];
+    total: number;
+    page: number;
+    totalPages: number;
+    query: string;
+  }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const skip = (page - 1) * limit;
+    const searchRegex = new RegExp(query, 'i');
+
+    const [messages, total] = await Promise.all([
+      Message.find({
+        conversationId: convObjectId,
+        type: 'TEXT',
+        isDeleted: false,
+        deletedForUsers: { $ne: userObjectId },
+        'content.text': searchRegex
+      })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean()
+        .exec(),
+      Message.countDocuments({
+        conversationId: convObjectId,
+        type: 'TEXT',
+        isDeleted: false,
+        deletedForUsers: { $ne: userObjectId },
+        'content.text': searchRegex
+      })
+    ]);
+
+    return {
+      messages,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+      query
+    };
+  }
+
+  /**
+   * Lưu nháp tin nhắn (lưu vào ConversationMember)
+   */
+  async saveDraft(
+    conversationId: string,
+    userId: string,
+    text: string
+  ): Promise<{ draft: string }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOneAndUpdate(
+      { conversationId: convObjectId, userId: userObjectId },
+      { $set: { draft: text } },
+      { new: true, timestamps: false }
+    );
+
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    return { draft: text };
+  }
+
+  /**
+   * Lấy nháp tin nhắn
+   */
+  async getDraft(
+    conversationId: string,
+    userId: string
+  ): Promise<{ draft: string | null }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    }).lean();
+
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    return { draft: (member as any).draft || null };
+  }
+
+  /**
+   * Cập nhật theme emoji của phòng
+   */
+  async updateThemeEmoji(
+    conversationId: string,
+    userId: string,
+    themeEmoji: string
+  ): Promise<{ conversation: IConversation }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const conversation = await Conversation.findByIdAndUpdate(
+      convObjectId,
+      { $set: { themeEmoji } },
+      { new: true }
+    );
+
+    if (!conversation) throw new Error('Phòng chat không tồn tại');
+
+    // Emit realtime
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitThemeEmojiUpdated } = await import('./message.socket');
+        emitThemeEmojiUpdated(io, conversationId, {
+          conversationId,
+          themeEmoji,
+          updatedBy: userId,
+          timestamp: new Date()
+        });
+      }
+    } catch (error) {
+      console.error('Lỗi emit updateThemeEmoji:', error);
+    }
+
+    return { conversation };
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // Group Management
+  // ─────────────────────────────────────────────────────────
+
+  /**
+   * Lấy danh sách thành viên nhóm
+   */
+  async getGroupMembers(
+    conversationId: string,
+    userId: string
+  ): Promise<{ members: any[] }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const members = await ConversationMember.find({
+      conversationId: convObjectId,
+      leftAt: null
+    })
+      .populate('userId', 'displayName username avatar')
+      .lean();
+
+    const formatted = members.map((m: any) => {
+      const user = m.userId as any;
+      return {
+        memberId: m._id,
+        userId: user._id || user,
+        displayName: user.displayName || user.username || 'Người dùng',
+        username: user.username,
+        avatar: user.avatar,
+        role: m.role,
+        nickname: m.nickname,
+        joinedAt: m.joinedAt
+      };
+    });
+
+    return { members: formatted };
+  }
+
+  /**
+   * Thêm thành viên vào nhóm
+   */
+  async addGroupMembers(
+    conversationId: string,
+    userId: string,
+    memberIds: string[]
+  ): Promise<{ added: number }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+    if (member.role !== 'ADMIN') throw new Error('Bạn không có quyền thêm thành viên');
+
+    const conversation = await Conversation.findById(convObjectId);
+    if (!conversation) throw new Error('Phòng chat không tồn tại');
+
+    let added = 0;
+    for (const newMemberId of memberIds) {
+      try {
+        const newMemberObjectId = new mongoose.Types.ObjectId(newMemberId);
+        // Kiểm tra đã là thành viên chưa
+        const exists = await ConversationMember.findOne({
+          conversationId: convObjectId,
+          userId: newMemberObjectId
+        });
+        if (exists) continue;
+
+        await ConversationMember.create({
+          conversationId: convObjectId,
+          userId: newMemberObjectId,
+          role: 'MEMBER'
+        });
+
+        added++;
+      } catch (e) {
+        continue;
+      }
+    }
+
+    // Cập nhật memberCount
+    await Conversation.updateOne(
+      { _id: convObjectId },
+      { $inc: { memberCount: added } }
+    );
+
+    // Emit cập nhật danh sách phòng cho các thành viên mới
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitConversationListUpdated } = await import('./message.socket');
+        for (const newMemberId of memberIds) {
+          emitConversationListUpdated(io, newMemberId);
+        }
+      }
+    } catch (e) {
+      console.error('Lỗi emit addGroupMembers:', e);
+    }
+
+    return { added };
+  }
+
+  /**
+   * Xóa thành viên khỏi nhóm
+   */
+  async removeGroupMember(
+    conversationId: string,
+    userId: string,
+    targetUserId: string
+  ): Promise<{ success: boolean }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const targetObjectId = new mongoose.Types.ObjectId(targetUserId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+    if (member.role !== 'ADMIN') throw new Error('Bạn không có quyền xóa thành viên');
+
+    await ConversationMember.deleteOne({
+      conversationId: convObjectId,
+      userId: targetObjectId
+    });
+
+    // Cập nhật memberCount
+    await Conversation.updateOne({ _id: convObjectId }, { $inc: { memberCount: -1 } });
+
+    return { success: true };
+  }
+
+  /**
+   * Đổi tên nhóm
+   */
+  async renameGroup(
+    conversationId: string,
+    userId: string,
+    name: string
+  ): Promise<{ conversation: IConversation }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+    if (member.role !== 'ADMIN') throw new Error('Bạn không có quyền đổi tên nhóm');
+
+    const conversation = await Conversation.findByIdAndUpdate(
+      convObjectId,
+      { $set: { name } },
+      { new: true }
+    );
+
+    if (!conversation) throw new Error('Phòng chat không tồn tại');
+
+    // Emit cập nhật cho tất cả thành viên
+    try {
+      const { io } = await import('../../server');
+      if (io) {
+        const { emitConversationListUpdated } = await import('./message.socket');
+        const members = await ConversationMember.find({ conversationId: convObjectId }).lean();
+        for (const m of members) {
+          emitConversationListUpdated(io, (m.userId as any).toString());
+        }
+      }
+    } catch (e) {
+      console.error('Lỗi emit renameGroup:', e);
+    }
+
+    return { conversation };
+  }
+
+  /**
+   * Đổi avatar nhóm
+   */
+  async updateGroupAvatar(
+    conversationId: string,
+    userId: string,
+    avatarUrl: string
+  ): Promise<{ conversation: IConversation }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const conversation = await Conversation.findById(convObjectId);
+
+    if (!conversation) throw new Error('Phòng chat không tồn tại');
+
+    // Xóa avatar cũ nếu có trên ổ đĩa
+    if (conversation.avatar && conversation.avatar !== avatarUrl && conversation.avatar.startsWith('/uploads/')) {
+      try {
+        const oldAvatarPath = path.join(process.cwd(), conversation.avatar);
+        if (fs.existsSync(oldAvatarPath)) {
+          fs.unlinkSync(oldAvatarPath);
+        }
+      } catch (err) {
+        console.error('Lỗi khi xóa avatar nhóm cũ:', err);
+      }
+    }
+
+    conversation.avatar = avatarUrl;
+    await conversation.save();
+
+    return { conversation };
+  }
+
+  /**
+   * Lấy shared media (ảnh, video, audio, file) trong phòng chat
+   * Dùng cho MediaGallery screen
+   */
+  async getSharedMedia(
+    conversationId: string,
+    userId: string,
+    type?: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'FILE',
+    page: number = 1,
+    limit: number = 30
+  ): Promise<{
+    messages: IMessage[];
+    total: number;
+    page: number;
+    totalPages: number;
+    type?: string;
+  }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const skip = (page - 1) * limit;
+
+    const query: any = {
+      conversationId: convObjectId,
+      isDeleted: false,
+      deletedForUsers: { $ne: userObjectId },
+      'content.mediaUrl': { $ne: null }
+    };
+
+    if (type) {
+      query.type = type;
+    } else {
+      // Lấy tất cả media types
+      query.type = { $in: ['IMAGE', 'VIDEO', 'AUDIO', 'FILE'] };
+    }
+
+    const [messages, total] = await Promise.all([
+      Message.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean()
+        .exec(),
+      Message.countDocuments(query)
+    ]);
+
+    return {
+      messages,
+      total,
+      page,
+      totalPages: Math.ceil(total / limit),
+      type
+    };
+  }
+
+  /**
+   * Xóa lịch sử cuộc trò chuyện phía user
+   */
+  async deleteConversationHistory(conversationId: string, userId: string): Promise<{ success: boolean }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    // Thêm userId vào mảng deletedForUsers của tất cả tin nhắn
+    await Message.updateMany(
+      { conversationId: convObjectId },
+      { $addToSet: { deletedForUsers: userObjectId } }
+    );
+
+    // Reset unreadCount
+    await ConversationMember.updateOne(
+      { _id: member._id },
+      { $set: { unreadCount: 0 } },
+      { timestamps: false }
+    );
+
+    // Kiểm tra nếu TẤT CẢ thành viên đã xóa lịch sử → xóa file media vật lý
+    try {
+      const allMembers = await ConversationMember.find({ conversationId: convObjectId }).lean();
+      const allMemberIds = allMembers.map(m => (m.userId as any).toString());
+
+      // Lấy tất cả tin nhắn có media trong cuộc trò chuyện
+      const mediaMessages = await Message.find({
+        conversationId: convObjectId,
+        type: { $in: ['IMAGE', 'VIDEO', 'AUDIO', 'FILE'] },
+        'content.mediaUrl': { $exists: true, $ne: null }
+      }).lean();
+
+      for (const msg of mediaMessages) {
+        // Kiểm tra xem tất cả thành viên có trong deletedForUsers chưa
+        const deletedForUserIds = ((msg as any).deletedForUsers || []).map((id: any) => id.toString());
+        const allDeleted = allMemberIds.every(mid => deletedForUserIds.includes(mid));
+
+        if (allDeleted) {
+          deleteMediaFiles((msg as any).content?.mediaUrl);
+        }
+      }
+    } catch (err) {
+      console.error('[Media] Lỗi kiểm tra và xóa file khi xóa lịch sử:', err);
+    }
+
+    return { success: true };
+  }
+
+  /**
+   * Thoát nhóm
+   */
+  async leaveGroup(
+    conversationId: string,
+    userId: string
+  ): Promise<{ disbanded: boolean }> {
+    const convObjectId = new mongoose.Types.ObjectId(conversationId);
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+
+    const member = await ConversationMember.findOne({
+      conversationId: convObjectId,
+      userId: userObjectId
+    });
+    if (!member) throw new Error('Bạn không ở trong phòng chat này');
+
+    const remainingMembers = await ConversationMember.countDocuments({
+      conversationId: convObjectId
+    });
+
+    // Nếu admin thoát và còn thành viên → chặn
+    if (member.role === 'ADMIN' && remainingMembers > 1) {
+      throw new Error('Admin không thể thoát nhóm khi còn thành viên khác');
+    }
+
+    await ConversationMember.deleteOne({ conversationId: convObjectId, userId: userObjectId });
+
+    let disbanded = false;
+    if (remainingMembers <= 1) {
+      // Xóa nhóm nếu không còn ai
+      await Conversation.updateOne({ _id: convObjectId }, { $set: { isDeleted: true } });
+      disbanded = true;
+
+      // Nhóm bị giải tán hoàn toàn, xóa toàn bộ file vật lý của nhóm này
+      try {
+        const mediaMessages = await Message.find({
+          conversationId: convObjectId,
+          type: { $in: ['IMAGE', 'VIDEO', 'AUDIO', 'FILE'] },
+          'content.mediaUrl': { $exists: true, $ne: null }
+        }).lean();
+        
+        for (const msg of mediaMessages) {
+          deleteMediaFiles((msg as any).content?.mediaUrl);
+        }
+      } catch (err) {
+        console.error('Lỗi khi xóa file vật lý lúc giải tán nhóm:', err);
+      }
+    } else {
+      await Conversation.updateOne({ _id: convObjectId }, { $inc: { memberCount: -1 } });
+    }
+
+    return { disbanded };
   }
 }
 

@@ -74,12 +74,29 @@ const apiEndpoints = [
   { method: 'DELETE', path: '/api/v1/users/push-token', description: 'Hủy đăng ký push token', auth: true, body: ['token'] },
   { method: 'GET', path: '/api/v1/users/push-tokens', description: 'Lấy danh sách push tokens của user', auth: true }
   ,
-  { method: 'GET', path: '/api/v1/conversations', description: 'Lấy danh sách phòng chat của user', auth: true, query: ['page?', 'limit?'] },
+  { method: 'GET', path: '/api/v1/conversations', description: 'Lấy danh sách phòng chat của user', auth: true, query: ['page?', 'limit?', 'type? (PRIVATE|GROUP)', 'search?'] },
   { method: 'POST', path: '/api/v1/conversations/private', description: 'Tạo / lấy phòng chat 1-1', auth: true, body: ['userId'] },
   { method: 'POST', path: '/api/v1/conversations/group', description: 'Tạo phòng chat nhóm', auth: true, body: ['name', 'memberIds?'] },
   { method: 'GET', path: '/api/v1/conversations/:id/messages', description: 'Lấy danh sách tin nhắn trong phòng', auth: true, query: ['page?', 'limit?'] },
-  { method: 'POST', path: '/api/v1/conversations/:id/messages', description: 'Gửi tin nhắn trong phòng', auth: true, body: ['type', 'text?', 'mediaUrl?'] },
-  { method: 'PATCH', path: '/api/v1/conversations/:id/settings', description: 'Cập nhật cấu hình phòng (nickname, background, mute, pin, block)', auth: true, body: ['nickname?', 'customBackground?', 'isMuted?', 'isPinned?', 'isBlocked?'] }
+  { method: 'POST', path: '/api/v1/conversations/:id/messages', description: 'Gửi tin nhắn trong phòng', auth: true, body: ['type', 'text?', 'mediaUrl?', 'mimeType?', 'fileName?', 'fileSize?', 'duration?', 'replyToMessageId?'] },
+  { method: 'PUT', path: '/api/v1/conversations/:id/messages/:messageId', description: 'Sửa tin nhắn (chỉ TEXT, chỉ sender)', auth: true, body: ['text'] },
+  { method: 'DELETE', path: '/api/v1/conversations/:id/messages/:messageId', description: 'Xóa tin nhắn (deleteForEveryone hoặc chỉ ẩn với mình)', auth: true, body: ['deleteForEveryone?'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/messages/:messageId/forward', description: 'Forward tin nhắn sang nhiều phòng', auth: true, body: ['conversationIds'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/messages/:messageId/pin', description: 'Ghim tin nhắn (admin nhóm hoặc thành viên phòng 1-1)', auth: true },
+  { method: 'DELETE', path: '/api/v1/conversations/:id/messages/:messageId/pin', description: 'Bỏ ghim tin nhắn', auth: true },
+  { method: 'GET', path: '/api/v1/conversations/:id/messages/pinned', description: 'Lấy danh sách tin nhắn đã ghim', auth: true },
+  { method: 'PATCH', path: '/api/v1/conversations/:id/messages/:messageId/seen', description: 'Đánh dấu tin nhắn đã xem', auth: true },
+  { method: 'GET', path: '/api/v1/conversations/:id/messages/search', description: 'Tìm kiếm tin nhắn theo từ khóa', auth: true, query: ['q (required)', 'page?', 'limit?'] },
+  { method: 'GET', path: '/api/v1/conversations/:id/messages/filter', description: 'Lọc tin nhắn theo người gửi', auth: true, query: ['senderId (required)', 'page?', 'limit?'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/draft', description: 'Lưu nháp tin nhắn', auth: true, body: ['draft'] },
+  { method: 'GET', path: '/api/v1/conversations/:id/draft', description: 'Lấy nháp tin nhắn', auth: true },
+  { method: 'PATCH', path: '/api/v1/conversations/:id/settings', description: 'Cập nhật cấu hình phòng (nickname, background, mute, pin, block)', auth: true, body: ['nickname?', 'customBackground?', 'isMuted?', 'isPinned?', 'isConversationBlocked?'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/upload/image', description: 'Upload ảnh cho chat (max 10MB)', auth: true, body: ['file (multipart)'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/upload/video', description: 'Upload video cho chat (max 100MB)', auth: true, body: ['file (multipart)'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/upload/audio', description: 'Upload audio cho chat (max 50MB)', auth: true, body: ['file (multipart)'] },
+  { method: 'POST', path: '/api/v1/conversations/:id/upload/file', description: 'Upload tài liệu cho chat (max 50MB)', auth: true, body: ['file (multipart)'] },
+  { method: 'POST', path: '/api/v1/conversations/:conversationId/messages/:messageId/reactions', description: 'Thêm / cập nhật reaction', auth: true, body: ['type (LIKE|LOVE|HAHA|WOW|SAD|ANGRY)'] },
+  { method: 'DELETE', path: '/api/v1/conversations/:conversationId/messages/:messageId/reactions', description: 'Xóa reaction', auth: true }
 ];
 
 app.get('/api', (req: Request, res: Response) => {
